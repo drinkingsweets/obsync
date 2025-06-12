@@ -8356,7 +8356,6 @@ var WebsocketProvider = class extends ObservableV2 {
 // main.ts
 var DEFAULT_SETTINGS = {
   serverUrl: "ws://95.165.167.11:9009",
-  // Updated to match error
   accessKey: "konchalka-shared-workspace",
   sharedFolders: ["shared"],
   nickname: "Anonymous"
@@ -8445,14 +8444,50 @@ var RelayPlugin = class extends import_obsidian.Plugin {
     for (const folder of sharedFolders) {
       const yDoc = new Doc();
       const provider = new WebsocketProvider(
-        `${serverUrl}?key=${accessKey}&folder=${folder}`,
+        `${serverUrl}?key=${accessKey}&folder=${encodeURIComponent(folder)}`,
         `obsidian-${folder}`,
         yDoc
       );
       this.yDocs.set(folder, yDoc);
       this.providers.set(folder, provider);
-      await this.initializeFolderFiles(folder, yDoc, serverUrl);
+      const pngsFolder = (0, import_obsidian.normalizePath)(`${folder}/pngs`);
+      if (!await this.app.vault.adapter.exists(pngsFolder)) {
+        await this.app.vault.adapter.mkdir(pngsFolder);
+      }
+      await this.initializeFolderFiles(folder, yDoc);
       const yFiles = yDoc.getMap("files");
+      yFiles.forEach(async (content, filePath) => {
+        if (typeof content === "string") {
+          const normalizedPath = (0, import_obsidian.normalizePath)(`${folder}/${filePath}`);
+          const fileExists = await this.app.vault.adapter.exists(normalizedPath);
+          if (!fileExists) {
+            try {
+              await this.app.vault.adapter.write(normalizedPath, content);
+              new import_obsidian.Notice(`Synced existing file ${filePath}`);
+            } catch {
+              new import_obsidian.Notice(`Failed to sync existing file ${filePath}`);
+            }
+          }
+        }
+      });
+      const yAttachments = yDoc.getMap("attachments");
+      yAttachments.forEach(async (attachment, filename) => {
+        if (attachment) {
+          const filePath = (0, import_obsidian.normalizePath)(`${folder}/${filename}`);
+          const fileExists = await this.app.vault.adapter.exists(filePath);
+          if (!fileExists) {
+            const url = `${serverUrl.replace(/^ws:/, "http://")}/attachment/${filename.replace("pngs/", "")}`;
+            try {
+              const response = await (0, import_obsidian.requestUrl)({ url, method: "GET" });
+              await this.app.vault.adapter.mkdir((0, import_obsidian.normalizePath)(`${folder}/pngs`));
+              await this.app.vault.adapter.writeBinary(filePath, new Uint8Array(response.arrayBuffer));
+              new import_obsidian.Notice(`Synced existing attachment ${filename}`);
+            } catch {
+              new import_obsidian.Notice(`Failed to sync existing attachment ${filename}`);
+            }
+          }
+        }
+      });
       yFiles.observe((event) => {
         event.keysChanged.forEach(async (filePath) => {
           const content = yFiles.get(filePath);
@@ -8487,23 +8522,52 @@ var RelayPlugin = class extends import_obsidian.Plugin {
           if (file.extension === "md") {
             yFiles.delete(relativePath);
             new import_obsidian.Notice(`File ${relativePath} deleted and synced`);
-          } else {
-            yAttachments2.delete(relativePath);
-            new import_obsidian.Notice(`Attachment ${relativePath} deleted and synced`);
+          } else if (file.path.startsWith(`${folder}/pngs/`)) {
+            const attachmentPath = `pngs/${relativePath.replace("pngs/", "")}`;
+            yAttachments2.delete(attachmentPath);
+            new import_obsidian.Notice(`Attachment ${attachmentPath} deleted and synced`);
           }
         }
       });
-      const yAttachments = yDoc.getMap("attachments");
+      this.app.vault.on("create", async (file) => {
+        if (file instanceof import_obsidian.TFile && file.path.startsWith(`${folder}/pngs/`) && ["png", "jpg", "jpeg", "gif", "bmp", "webp"].includes(file.extension)) {
+          const relativePath = file.path.replace(`${folder}/pngs/`, "");
+          const attachmentPath = `pngs/${relativePath}`;
+          const yAttachments2 = yDoc.getMap("attachments");
+          if (!yAttachments2.has(attachmentPath)) {
+            try {
+              const arrayBuffer = await this.app.vault.adapter.readBinary(file.path);
+              const formData = new FormData();
+              formData.append("file", new Blob([arrayBuffer]), relativePath);
+              const response = await fetch(
+                `${serverUrl.replace(/^ws:/, "http://")}/upload?key=${encodeURIComponent(accessKey)}&folder=${encodeURIComponent(folder)}`,
+                { method: "POST", body: formData }
+              );
+              if (!response.ok)
+                throw new Error(`Server responded with ${response.status}`);
+              const result = await response.json();
+              if (result.filename) {
+                yAttachments2.set(attachmentPath, { path: `/attachment/${result.filename}` });
+                new import_obsidian.Notice(`New image ${attachmentPath} synced`);
+              }
+            } catch (err) {
+              const message = err instanceof Error ? err.message : "Unknown error";
+              new import_obsidian.Notice(`Failed to sync new image ${relativePath}: ${message}`);
+            }
+          }
+        }
+      });
       yAttachments.observe((event) => {
         event.keysChanged.forEach(async (filename) => {
           const attachment = yAttachments.get(filename);
           const filePath = (0, import_obsidian.normalizePath)(`${folder}/${filename}`);
           if (attachment) {
-            const url = `${serverUrl.replace(/^ws:/, "http://")}/attachment/${filename}`;
+            const url = `${serverUrl.replace(/^ws:/, "http://")}/attachment/${filename.replace("pngs/", "")}`;
             try {
               const response = await (0, import_obsidian.requestUrl)({ url, method: "GET" });
+              await this.app.vault.adapter.mkdir((0, import_obsidian.normalizePath)(`${folder}/pngs`));
               await this.app.vault.adapter.writeBinary(filePath, new Uint8Array(response.arrayBuffer));
-              new import_obsidian.Notice(`Attachment ${filename} synced`);
+              new import_obsidian.Notice(`Attachment ${filename} synced to ${filePath}`);
             } catch {
               new import_obsidian.Notice(`Failed to sync attachment ${filename}`);
             }
@@ -8575,7 +8639,7 @@ var RelayPlugin = class extends import_obsidian.Plugin {
       debouncedUpdateCursors(folder, provider);
     }
   }
-  async initializeFolderFiles(folder, yDoc, serverUrl) {
+  async initializeFolderFiles(folder, yDoc) {
     const folderObj = this.app.vault.getAbstractFileByPath(folder);
     if (folderObj instanceof import_obsidian.TFolder) {
       const yFiles = yDoc.getMap("files");
@@ -8588,9 +8652,31 @@ var RelayPlugin = class extends import_obsidian.Plugin {
               const content = await this.app.vault.adapter.read(child.path);
               if (!yFiles.get(relativePath))
                 yFiles.set(relativePath, content);
-            } else {
-              if (!yAttachments.get(relativePath))
-                yAttachments.set(relativePath, { path: `/attachments/${relativePath}` });
+            } else if (["png", "jpg", "jpeg", "gif", "bmp", "webp"].includes(child.extension)) {
+              if (child.path.startsWith(`${folder2.path}/pngs/`)) {
+                const attachmentPath = `pngs/${relativePath}`;
+                if (!yAttachments.has(attachmentPath)) {
+                  try {
+                    const arrayBuffer = await this.app.vault.adapter.readBinary(child.path);
+                    const formData = new FormData();
+                    formData.append("file", new Blob([arrayBuffer]), relativePath);
+                    const response = await fetch(
+                      `${this.settings.serverUrl.replace(/^ws:/, "http://")}/upload?key=${encodeURIComponent(this.settings.accessKey)}&folder=${encodeURIComponent(folder2.path)}`,
+                      { method: "POST", body: formData }
+                    );
+                    if (!response.ok)
+                      throw new Error(`Server responded with ${response.status}`);
+                    const result = await response.json();
+                    if (result.filename) {
+                      yAttachments.set(attachmentPath, { path: `/attachment/${result.filename}` });
+                      new import_obsidian.Notice(`Initialized ${attachmentPath} synced`);
+                    }
+                  } catch (err) {
+                    const message = err instanceof Error ? err.message : "Unknown error";
+                    new import_obsidian.Notice(`Failed to sync ${attachmentPath}: ${message}`);
+                  }
+                }
+              }
             }
           } else if (child instanceof import_obsidian.TFolder) {
             await processFiles(child);
@@ -8622,7 +8708,7 @@ var RelayPlugin = class extends import_obsidian.Plugin {
   async uploadAttachment() {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = "image/*,.pdf";
+    input.accept = "image/*";
     input.onchange = async () => {
       if (!input.files || input.files.length === 0)
         return;
@@ -8636,7 +8722,7 @@ var RelayPlugin = class extends import_obsidian.Plugin {
     formData.append("file", file);
     try {
       const response = await fetch(
-        `${this.settings.serverUrl.replace(/^ws:/, "http://")}/upload?key=${encodeURIComponent(this.settings.accessKey)}&folder=${folder}`,
+        `${this.settings.serverUrl.replace(/^ws:/, "http://")}/upload?key=${encodeURIComponent(this.settings.accessKey)}&folder=${encodeURIComponent(folder)}`,
         { method: "POST", body: formData }
       );
       if (!response.ok)
@@ -8644,13 +8730,17 @@ var RelayPlugin = class extends import_obsidian.Plugin {
       const result = await response.json();
       const yDoc = this.yDocs.get(folder);
       if (result.filename && yDoc) {
-        yDoc.getMap("attachments").set(result.filename, { path: result.path });
-        new import_obsidian.Notice(`Attachment ${result.filename} uploaded`);
-        return result.filename;
+        const localPath = (0, import_obsidian.normalizePath)(`${folder}/pngs/${result.filename}`);
+        await this.app.vault.adapter.mkdir((0, import_obsidian.normalizePath)(`${folder}/pngs`));
+        const arrayBuffer = await file.arrayBuffer();
+        await this.app.vault.adapter.writeBinary(localPath, new Uint8Array(arrayBuffer));
+        yDoc.getMap("attachments").set(`pngs/${result.filename}`, { path: `/attachment/${result.filename}` });
+        new import_obsidian.Notice(`Uploaded ${result.filename} to ${folder}/pngs`);
+        return `pngs/${result.filename}`;
       }
     } catch (err) {
-      new import_obsidian.Notice(`Failed to upload ${file.name}. Try manual upload via "Upload attachment".`);
-      this.uploadAttachment();
+      const message = err instanceof Error ? err.message : "Unknown error";
+      new import_obsidian.Notice(`Failed to upload ${file.name}: ${message}`);
     }
     return null;
   }
@@ -8658,24 +8748,23 @@ var RelayPlugin = class extends import_obsidian.Plugin {
     const folder = this.settings.sharedFolders[0];
     const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "");
     const filename = `Pasted image ${timestamp}.png`;
-    const uploadedFilename = await this.uploadFile(file, folder);
-    if (uploadedFilename) {
+    const uploadedPath = await this.uploadFile(file, folder);
+    if (uploadedPath) {
       const editor = view.editor;
-      editor.replaceSelection(`![[${uploadedFilename}]]`);
+      editor.replaceSelection(`![[${uploadedPath}]]`);
     }
   }
   async checkMarkdownImages(content, folder, yDoc) {
-    const imageRegex = /!\[\[([^\]]+\.(?:png|jpg|jpeg|gif|bmp|webp))\]\]/g;
+    const imageRegex = /!\[\[([^\]]*?(?:pngs\/[^\]]*?\.(?:png|jpg|jpeg|gif|bmp|webp)))\]\]/g;
     let match;
     while ((match = imageRegex.exec(content)) !== null) {
-      const filename = match[1];
-      const filePath = (0, import_obsidian.normalizePath)(`${folder}/${filename}`);
+      const imagePath = match[1];
+      const filePath = (0, import_obsidian.normalizePath)(`${folder}/${imagePath}`);
       const fileExists = await this.app.vault.adapter.exists(filePath);
       if (!fileExists) {
         const yAttachments = yDoc.getMap("attachments");
-        if (!yAttachments.has(filename)) {
-          new import_obsidian.Notice(`Image ${filename} not found. Please upload it using "Upload attachment".`);
-          this.uploadAttachment();
+        if (!yAttachments.has(imagePath)) {
+          new import_obsidian.Notice(`Image ${imagePath} not found`);
         }
       }
     }
@@ -8731,12 +8820,12 @@ var RelayPlugin = class extends import_obsidian.Plugin {
               charWidth = spanRect.width / (spanEl.textContent?.length || 1);
             }
             const lineRect = lineEl.getBoundingClientRect();
-            const editorRect = editorEl.getBoundingClientRect();
+            const editorTop = editorEl.getBoundingClientRect().top;
             const cursorEl = document.createElement("div");
             cursorEl.className = "remote-cursor";
             cursorEl.style.backgroundColor = getUserColor(clientId);
             cursorEl.style.left = `${column * charWidth}px`;
-            cursorEl.style.top = `${lineRect.top - editorRect.top}px`;
+            cursorEl.style.top = `${lineRect.top - editorTop}px`;
             editorEl.appendChild(cursorEl);
             newElements.push(cursorEl);
             const labelEl = document.createElement("div");
@@ -8744,7 +8833,7 @@ var RelayPlugin = class extends import_obsidian.Plugin {
             labelEl.textContent = nickname || `User ${clientId}`;
             labelEl.style.backgroundColor = getUserColor(clientId);
             labelEl.style.left = `${column * charWidth}px`;
-            labelEl.style.top = `${lineRect.top - editorRect.top - 16}px`;
+            labelEl.style.top = `${lineRect.top - editorTop - 16}px`;
             editorEl.appendChild(labelEl);
             newElements.push(labelEl);
             console.log(`Rendering cursor for client ${clientId} (${nickname}) at line ${line}, column ${column}, charWidth: ${charWidth}`);
@@ -8829,7 +8918,7 @@ var LiveCursorView = class extends import_obsidian.ItemView {
     const container = this.containerEl.children[1];
     container.empty();
     const nickname = this.plugin.settings.nickname;
-    container.createEl("h3", { text: `Welcome, ${nickname}` });
+    container.createEl("h3", { text: `Welcome back, ${nickname}` });
   }
   async onClose() {
   }
