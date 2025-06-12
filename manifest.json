@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-relay-plugin",
+  "name": "Relay Plugin",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "A plugin for real-time collaboration in Obsidian with live cursors and attachment support",
+  "author": "Your Name",
+  "isDesktopOnly": false
+}
